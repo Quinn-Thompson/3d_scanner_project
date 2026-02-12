@@ -35,7 +35,7 @@ typedef struct {
 
 typedef struct {
     uint16_t data[1024];
-    uint8_t front;
+    int8_t front;
     int8_t rear;
     uint8_t count; 
 } Queue;
@@ -69,7 +69,7 @@ bool enqueue(Queue *q, uint16_t values[], size_t number_of_values) {
 bool dequeue(Queue *q, uint16_t values[], size_t number_of_values) {
     if (is_empty(q)) return false;
     for (uint8_t i = 0; i < number_of_values; i++){
-        value[i] = q->data[q->front];
+        values[i] = q->data[q->front];
         q->front = (q->front + 1) % 1024;
         q->count--;
     }
@@ -146,21 +146,21 @@ int setup_serial(){
     return serial_port;
 }
 
-void send_write_buffer(){
-    if (is_empty(uart_write_queue)){
+void send_write_buffer(uint8_t serial_port){
+    if (!is_empty(&uart_write_queue)){
         // first word will be the length of the packet
         uint16_t packet_length[1];
-        dequeue(uart_write_queue, packet_length, 1);
+        dequeue(&uart_write_queue, packet_length, 1);
         // write the actual info
-        uint16_t packet[packet_length];
-        dequeue(uart_write_queue, packet, packet_length);
+        uint16_t packet[packet_length[0]];
+        dequeue(&uart_write_queue, packet, packet_length[0]);
         write(serial_port, packet, sizeof(packet));
     }
 }
 
 void setup_packet_for_sending(int serial_port, uint16_t data[], size_t list_length, InfoPacket info){
     uint16_t to_queue_packet[list_length + 4];
-    to_queue_packet[0] = list_length + 4;
+    to_queue_packet[0] = list_length + 3;
     to_queue_packet[1] = HEADER_VALUE;
     uint16_t checksum = 0;
     uint16_t info_packet = 0;
@@ -170,7 +170,7 @@ void setup_packet_for_sending(int serial_port, uint16_t data[], size_t list_leng
     info_packet |= (info.index_location << INDEX_START) & 0b111111;
     info_packet |= (list_length << SIZE_START) & 0b111111;
     checksum = checksum + info_packet;
-    to_queue_packet[2] = info_packet
+    to_queue_packet[2] = info_packet;
 
     for (uint8_t i = 0; i < list_length; i = i + 1){
 
@@ -180,7 +180,7 @@ void setup_packet_for_sending(int serial_port, uint16_t data[], size_t list_leng
     // invert checksum to use summation instead and avoid power off issue
     checksum = ~checksum;
     to_queue_packet[list_length + 3] = checksum;
-    enqueue(uart_write_queue, to_queue_packet, list_length + 4)
+    enqueue(&uart_write_queue, to_queue_packet, list_length + 4);
     
 }
 
@@ -214,7 +214,7 @@ void start_calibration(uint8_t serial_port){
 }
 
 void main(){
-    init_queue(uart_write_queue);
+    init_queue(&uart_write_queue);
     // write_to_hard_drive();
     uint8_t serial_port = setup_serial();
     
@@ -227,7 +227,7 @@ void main(){
     while (true){
         start_calibration(serial_port);
         sleep(1);
-        send_write_buffer();
+        send_write_buffer(serial_port);
         // printf("Bytes Available %i", bytesavail);
 
 
