@@ -22,7 +22,7 @@
 #define HEADER_VALUE 0x54 // 01010100
 #define FOOTER_VALUE 0x00 // 01010100
 
-#define START_CALIBRATION_INDEX 0
+#define FLAG_INDEX 0
 
 uint8_t input_information[INPUT_SIZE];
 
@@ -137,17 +137,25 @@ uint8_t * read_packet(uint8_t serial_port){
 }
 
 
-void main(){
+void start_calibration(){
     InfoPacket info_packet = {
         .read_flag = false,
         .words_per_val = 0,
         .type_flag = false,
-        .index_location = START_CALIBRATION_INDEX,
+        .index_location = FLAG_INDEX,
     };
+    uint8_t offset = 0;
+    uint8_t length = 0;
+    uint8_t data = 1;
+    uint16_t packet[1] = {data & (length << 8) & (offset << 11)};
+    send_data_to_arduino(serial_port, packet, 1, info_packet);
+}
+
+void main(){
+
     // write_to_hard_drive();
     int serial_port = setup_serial();
-    uint16_t packet[1] = {0x0001};
-    send_data_to_arduino(serial_port, packet, 3, info_packet);
+    start_calibration();
 
     uint8_t single_value;
 
