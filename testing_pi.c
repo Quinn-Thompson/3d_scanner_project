@@ -116,8 +116,7 @@ void send_data_to_arduino(int serial_port, uint16_t packets[], size_t list_lengt
         checksum = checksum + packets[i];
     }
     checksum = ~checksum;
-    printf("%i", checksum);
-    fflush(stdout);
+
     // invert checksum to use summation instead and avoid power off issue
     write(serial_port, &checksum, sizeof(checksum)); 
 }
@@ -137,7 +136,7 @@ uint8_t * read_packet(uint8_t serial_port){
 }
 
 
-void start_calibration(){
+void start_calibration(uint8_t serial_port){
     InfoPacket info_packet = {
         .read_flag = false,
         .words_per_val = 0,
@@ -147,15 +146,15 @@ void start_calibration(){
     uint8_t offset = 0;
     uint8_t length = 0;
     uint8_t data = 1;
-    uint16_t packet[1] = {data & (length << 8) & (offset << 11)};
+    uint16_t packet[1] = {data | (length << 8) | (offset << 11)};
     send_data_to_arduino(serial_port, packet, 1, info_packet);
 }
 
 void main(){
 
     // write_to_hard_drive();
-    int serial_port = setup_serial();
-    start_calibration();
+    uint8_t serial_port = setup_serial();
+    
 
     uint8_t single_value;
 
@@ -163,6 +162,8 @@ void main(){
     bool packet_found = false;
     tcflush(serial_port, TCIOFLUSH);
     while (true){
+        start_calibration(serial_port);
+        sleep(1);
         // printf("Bytes Available %i", bytesavail);
 
 
