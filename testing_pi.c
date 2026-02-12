@@ -19,7 +19,7 @@
 #define INDEX_START 4
 #define SIZE_START 10
 
-#define HEADER_VALUE 0x54 // 01010100
+#define HEADER_VALUE 0x5454 // 01010100
 #define FOOTER_VALUE 0x00 // 01010100
 
 #define FLAG_INDEX 0
@@ -32,6 +32,56 @@ typedef struct {
     bool type_flag;
     uint8_t index_location;
 } InfoPacket;
+
+typedef struct {
+    uint16_t data[1024];
+    uint8_t front;
+    int8_t rear;
+    uint8_t count; 
+} Queue;
+
+Queue uart_write_queue;
+
+void init_queue(Queue *q) {
+    q->front = 0;
+    q->rear = -1;
+    q->count = 0;
+}
+
+bool is_empty(Queue *q) {
+    return q->count == 0;
+}
+
+bool is_full(Queue *q) {
+    return q->count == 1024;
+}
+
+bool enqueue(Queue *q, uint16_t values[], size_t number_of_values) {
+    if (is_full(q)) return false;
+    for (uint8_t i = 0; i < number_of_values; i++){
+        q->rear = (q->rear + 1) % 1024;
+        q->data[q->rear] = values[i];
+        q->count++;
+    }
+    return true;
+}
+
+bool dequeue(Queue *q, uint16_t values[], size_t number_of_values) {
+    if (is_empty(q)) return false;
+    for (uint8_t i = 0; i < number_of_values; i++){
+        value[i] = q->data[q->front];
+        q->front = (q->front + 1) % 1024;
+        q->count--;
+    }
+    return true;
+}
+
+bool peek(Queue *q, uint8_t *value) {
+    if (is_empty(q)) return false;
+    *value = q->data[q->front];
+    return true;
+}
+
 
 void write_to_hard_drive(){
     const char* filename = "binary_file.bin";
@@ -73,7 +123,7 @@ int setup_serial(){
     // write baud rate
     cfsetospeed(&tty, B115200);
 
-    // No parity
+    // just check to make sure nothing is enabled especially canonicalization
     tty.c_cflag &= ~PARENB;
     tty.c_cflag &= ~CSTOPB;
     tty.c_cflag &= ~CSIZE;
@@ -96,10 +146,22 @@ int setup_serial(){
     return serial_port;
 }
 
-void send_data_to_arduino(int serial_port, uint16_t packets[], size_t list_length, InfoPacket info){
+void send_write_buffer(){
+    if (is_empty(uart_write_queue)){
+        // first word will be the length of the packet
+        uint16_t packet_length[1];
+        dequeue(uart_write_queue, packet_length, 1);
+        // write the actual info
+        uint16_t packet[packet_length];
+        dequeue(uart_write_queue, packet, packet_length);
+        write(serial_port, packet, sizeof(packet));
+    }
+}
 
-    uint8_t header_message[] = {HEADER_VALUE, HEADER_VALUE};
-    write(serial_port, header_message, sizeof(header_message));
+void setup_packet_for_sending(int serial_port, uint16_t data[], size_t list_length, InfoPacket info){
+    uint16_t to_queue_packet[list_length + 4];
+    to_queue_packet[0] = list_length + 4;
+    to_queue_packet[1] = HEADER_VALUE;
     uint16_t checksum = 0;
     uint16_t info_packet = 0;
     info_packet |= info.read_flag << READ_FLAG;
@@ -108,17 +170,18 @@ void send_data_to_arduino(int serial_port, uint16_t packets[], size_t list_lengt
     info_packet |= (info.index_location << INDEX_START) & 0b111111;
     info_packet |= (list_length << SIZE_START) & 0b111111;
     checksum = checksum + info_packet;
-    write(serial_port, &info_packet, sizeof(info_packet));
+    to_queue_packet[2] = info_packet
 
     for (uint8_t i = 0; i < list_length; i = i + 1){
 
-        write(serial_port, &packets[i], sizeof(packets[i]));
-        checksum = checksum + packets[i];
+        to_queue_packet[i + 3] = data[i];
+        checksum = checksum + data[i];
     }
-    checksum = ~checksum;
-
     // invert checksum to use summation instead and avoid power off issue
-    write(serial_port, &checksum, sizeof(checksum)); 
+    checksum = ~checksum;
+    to_queue_packet[list_length + 3] = checksum;
+    enqueue(uart_write_queue, to_queue_packet, list_length + 4)
+    
 }
 
 uint8_t * read_packet(uint8_t serial_port){
@@ -147,11 +210,11 @@ void start_calibration(uint8_t serial_port){
     uint8_t length = 0;
     uint8_t data = 1;
     uint16_t packet[1] = {data | (length << 8) | (offset << 11)};
-    send_data_to_arduino(serial_port, packet, 1, info_packet);
+    setup_packet_for_sending(serial_port, packet, 1, info_packet);
 }
 
 void main(){
-
+    init_queue(uart_write_queue);
     // write_to_hard_drive();
     uint8_t serial_port = setup_serial();
     
@@ -164,6 +227,7 @@ void main(){
     while (true){
         start_calibration(serial_port);
         sleep(1);
+        send_write_buffer();
         // printf("Bytes Available %i", bytesavail);
 
 

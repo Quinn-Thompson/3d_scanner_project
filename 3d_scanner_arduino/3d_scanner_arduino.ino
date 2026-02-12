@@ -186,6 +186,50 @@ struct CalibrationItems{
   int16_t reset_position = NO_VAL;
 };
 
+typedef struct {
+    uint16_t data[64];
+    uint8_t front;
+    int8_t rear;
+    uint8_t count; 
+} Queue;
+
+void init_queue(Queue *q) {
+    q->front = 0;
+    q->rear = -1;
+    q->count = 0;
+}
+
+bool is_empty(Queue *q) {
+    return q->count == 0;
+}
+
+bool is_full(Queue *q) {
+    return q->count == 64;
+}
+
+bool enqueue(Queue *q, int value) {
+    if (is_full(q)) return false;
+    q->rear = (q->rear + 1) % 64;
+    q->data[q->rear] = value;
+    q->count++;
+    return true;
+}
+
+bool dequeue(Queue *q, int *value) {
+    if (is_empty(q)) return false;
+    *value = q->data[q->front];
+    q->front = (q->front + 1) % QUEUE_SIZE;
+    q->count--;
+    return true;
+}
+
+// Peek front
+bool peek(Queue *q, int *value) {
+    if (is_empty(q)) return false;
+    *value = q->data[q->front];
+    return true;
+}
+
 void write_serial_buffer(uint8_t servo_id, uint8_t command, uint16_t *parameters, size_t param_length, bool only_write){
   if (servo_id != 0xFE){
      digitalWrite(servo_en_addr[servo_id-1], LOW);
@@ -350,6 +394,7 @@ bool servo_is_servo_mode(uint8_t servo_id, uint8_t attempt_count){
   }
 }
 
+Queue uart_write_buffer;
 
 void setup() {
   Serial.begin(115200);
@@ -359,10 +404,13 @@ void setup() {
   Serial2.begin(115200);
   while (!Serial2) { ; }
   delay(500);
+  
+  init_queue(uart_write_buffer);
 
   bool no_connection = true;
   bool force_calibration = true;
 
+  // setus up servos
   pinMode(EN_SERIAL_PIN, OUTPUT);
   pinMode(EN_SERVO_PLATE, OUTPUT);
   pinMode(EN_SERVO_CAMERA, OUTPUT);
@@ -375,7 +423,7 @@ void setup() {
 
   digitalWrite(EN_SERVO_PLATE, LOW);
   digitalWrite(EN_SERVO_CAMERA, HIGH);
-
+  // write to any servo listening their id
   servo_id_write(0xFE, PLATE_SERVO);
 
   digitalWrite(EN_SERVO_PLATE, HIGH);
@@ -840,11 +888,11 @@ uint32_t pin_low = 0;
 uint8_t packet_index = 0;
 uint8_t data_length = 0;
 uint16_t read_buffer[32];
-uint16_t write_buffer[64];
-uint16_t priority_write_buffer[64];
 uint16_t data_buffer[64];
 bool type_flags[64];
 bool bus_held = false;
+
+
 
 int read_packet(){
   while (Serial2.available() > 2){
@@ -955,8 +1003,6 @@ void write_packet(int serial_port, uint16_t packets[], size_t list_length, InfoP
       checksum = checksum + packets[i];
   }
   checksum = ~checksum;
-  printf("%i", checksum);
-  fflush(stdout);
   // invert checksum to use summation instead and avoid power off issue
   Serial2.write(checksum[i] >> 8);
   Serial2.write(checksum[i] & 0xFF);
