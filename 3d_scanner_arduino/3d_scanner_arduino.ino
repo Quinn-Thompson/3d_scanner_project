@@ -162,6 +162,12 @@ enum ReadStatus {
     READ_TIMEOUT,
 };
 
+struct InfoPacket{
+    bool read_flag;
+    uint8_t words_per_val;
+    bool type_flag;
+    uint8_t index_location;
+};
 
 struct CalibrationItems{
   bool moving = false;
