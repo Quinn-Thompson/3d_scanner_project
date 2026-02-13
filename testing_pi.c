@@ -184,20 +184,105 @@ void setup_packet_for_sending(int serial_port, uint16_t data[], size_t list_leng
     
 }
 
-uint8_t * read_packet(uint8_t serial_port){
+uint16_t read_words(uint8_t serial_port, uint16_t *word){
     uint8_t current_packet[2];
-    int n = read(serial_port, current_packet, sizeof(current_packet));
-    if (n < 0){
-        if (errno == EAGAIN || errno == EWOULDBLOCK){
+    int8_t response_value = read(serial_port, current_packet, sizeof(current_packet));
+    if (response_value < 0){
+        if (errno == EAGAIN){
             usleep(1000);
         } else{
             perror("Read Error");
+            return 1;
         }
-    } else{
-        return current_packet; 
+    } else {
+        *word = (second_byte << 8) | first_byte;
+        return 0
     }
 }
 
+uint8_t read_packet(uint8_t serial_port){
+  while (ioctl(fd, FIONREAD, &bytes_available) >= 2){
+      uint16_t current_word;
+      read_words(serial_port, &current_word);
+      
+      read_buffer[packet_index] = current_word;
+      if (current_word == HEADER_VALUE){
+        packet_found = true;
+      } else if (packet_found) {
+        if (packet_index == 1) {
+          data_length = ((read_buffer[packet_index] >> 10) & 0b111111);
+        } if (packet_index - 1 > data_length){
+          packet_index = 0;
+          return 2;
+        }
+      } else {
+        packet_index = 0;
+        return 1;
+      }
+      packet_index += 1;
+    }
+  return 0;
+}
+
+void post_process_packet(){
+  // process the entire packet, wehther it be single message or a data packet
+  uint8_t packet_finished = read_packet();
+
+  // if we are just a single message
+  if (packet_finished == 1){
+    if (!bus_held && read_buffer[0] == HOLD_BUS){
+      bus_held = true;
+
+      uint16_t to_queue_packet[2] = {1, BUS_HELD};
+      enqueue(&uart_write_queue, to_queue_packet, 2);
+    } if (bus_held && read_buffer[0] == (SUCCESS_VALUE << 8) | SUCCESS_VALUE){
+      bus_held = false;
+    } 
+  } else if (packet_finished == 2){
+    // we are a data packet
+      uint16_t calculated_checksum = 0;
+      // sum the data and info word
+      for (uint8_t i = 1; i < data_length + 2; i++){
+        calculated_checksum = calculated_checksum + read_buffer[i];
+      }
+      packet_found = false;
+      // get the last word, it will be the reported inverted checksum, it should add with the checksum to be all 1s
+      if (calculated_checksum + read_buffer[data_length + 2] != 0xFFFF){
+        // tell the raspberry pi we have a bad packet
+        uint16_t to_queue_packet[2] = {1, FAILURE_VALUE};
+        enqueue(&uart_write_queue, to_queue_packet, 2);
+      } else {
+        // we have a good packet
+        uint16_t to_queue_packet[2] = {1, SUCCESS_VALUE};
+        enqueue(&uart_write_queue, to_queue_packet, 2);
+        // retreive individual items from info word
+        bool read_flag = read_buffer[1] & 0b1;
+        bool type_flag = (read_buffer[1] >> TYPE_FLAG) & 0b1;
+        uint8_t index = (read_buffer[1] >> INDEX_START) & 0b111111;
+        uint8_t words_per_val = (read_buffer[1] >> WORDS_PER_VAL) & 0b11;
+        uint8_t packet_length = read_buffer[1] >> SIZE_START;
+        // calculate number of bytes per data point
+        uint8_t base = 2;
+        uint8_t bytes_per_packet = 1;
+        while (words_per_val > 0) {
+            if (words_per_val % 2 == 1)
+                bytes_per_packet *= base;
+
+            base *= base;
+            words_per_val /= 2;
+        }
+
+        // check the set flag for reading the array or writing to it
+        if (read_flag){
+          noop;        
+        } else {
+          bus_held = false;
+          write_to_array(&read_buffer[2], packet_length, index, type_flag, words_per_val / 2);
+        }
+      }
+      
+    }
+}
 
 void start_calibration(uint8_t serial_port){
     InfoPacket info_packet = {

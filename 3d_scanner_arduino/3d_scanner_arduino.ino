@@ -56,6 +56,7 @@
 #define EN_SERIAL_PIN 4
 #define EN_SERVO_PLATE 5
 #define EN_SERVO_CAMERA 6
+#define FLAG_INDEX 0
 
 #define FRAME_HEADER 0x55
 
@@ -74,8 +75,13 @@
 #define GYRO_SERVO_WAIT 30
 
 #define START_CALIBRATION 0x0001
-#define HEADER_VALUE 0x54 // 00101010
-#define FAILURE_VALUE 0x67 // 00101010
+#define HEADER_VALUE 0x5454 // 00101010
+#define FAILURE_VALUE 0x6767 // 00101010
+#define SUCCESS_VALUE 0x7272 // 00101010
+#define BUS_HELD 0x3232 // 00101010
+#define HOLD_BUS 0x1414 // 00101010
+
+
 #define READ_FLAG 0
 #define WORDS_PER_VAL 1
 #define TYPE_FLAG 3
@@ -188,7 +194,7 @@ struct CalibrationItems{
 
 typedef struct {
     uint16_t data[64];
-    uint8_t front;
+    int8_t front;
     int8_t rear;
     uint8_t count; 
 } Queue;
@@ -204,27 +210,30 @@ bool is_empty(Queue *q) {
 }
 
 bool is_full(Queue *q) {
-    return q->count == 64;
+    return q->count == 1024;
 }
 
-bool enqueue(Queue *q, int value) {
+bool enqueue(Queue *q, uint16_t values[], size_t number_of_values) {
     if (is_full(q)) return false;
-    q->rear = (q->rear + 1) % 64;
-    q->data[q->rear] = value;
-    q->count++;
+    for (uint8_t i = 0; i < number_of_values; i++){
+        q->rear = (q->rear + 1) % 1024;
+        q->data[q->rear] = values[i];
+        q->count++;
+    }
     return true;
 }
 
-bool dequeue(Queue *q, int *value) {
+bool dequeue(Queue *q, uint16_t values[], size_t number_of_values) {
     if (is_empty(q)) return false;
-    *value = q->data[q->front];
-    q->front = (q->front + 1) % QUEUE_SIZE;
-    q->count--;
+    for (uint8_t i = 0; i < number_of_values; i++){
+        values[i] = q->data[q->front];
+        q->front = (q->front + 1) % 1024;
+        q->count--;
+    }
     return true;
 }
 
-// Peek front
-bool peek(Queue *q, int *value) {
+bool peek(Queue *q, uint8_t *value) {
     if (is_empty(q)) return false;
     *value = q->data[q->front];
     return true;
@@ -394,7 +403,7 @@ bool servo_is_servo_mode(uint8_t servo_id, uint8_t attempt_count){
   }
 }
 
-Queue uart_write_buffer;
+Queue uart_write_queue;
 
 void setup() {
   Serial.begin(115200);
@@ -405,7 +414,7 @@ void setup() {
   while (!Serial2) { ; }
   delay(500);
   
-  init_queue(uart_write_buffer);
+  init_queue(&uart_write_queue);
 
   bool no_connection = true;
   bool force_calibration = true;
@@ -894,22 +903,25 @@ bool bus_held = false;
 
 
 
-int read_packet(){
-  while (Serial2.available() > 2){
-
-      char first_byte = Serial2.read();
-      char second_byte = Serial2.read();
-      uint16_t current_word = {(first_byte << 8) || second_byte};
+uint8_t read_packet(){
+  while (Serial2.available() >= 2){
+      uint8_t first_byte = Serial2.read();
+      uint8_t second_byte = Serial2.read();
+      uint16_t current_word = (second_byte << 8) | first_byte;
+      
       read_buffer[packet_index] = current_word;
-      if (first_byte == HEADER_VALUE && second_byte == HEADER_VALUE){
+      if (current_word == HEADER_VALUE){
         packet_found = true;
       } else if (packet_found) {
         if (packet_index == 1) {
           data_length = ((read_buffer[packet_index] >> 10) & 0b111111);
         } if (packet_index - 1 > data_length){
+          packet_index = 0;
+          Serial.println("finished_packet");
           return 2;
         }
       } else {
+        packet_index = 0;
         return 1;
       }
       packet_index += 1;
@@ -917,103 +929,154 @@ int read_packet(){
   return 0;
 }
 
-void write_to_array(uint16_t data[], uint8_t index, bool type_flag, uint8_t packet_size){
-  if (packet_size == 0){
-    uint8_t offset = (data >> 12) & 0b1111;
-    uint16_t byte_data = (data) & 0xFF
-    data_buffer[index] |= (byte_data << offset);
-    type_flags[index] = 0;
-  } else {
-    for (uint8_t i = 0; i < packet_size; i++) {
-      data_buffer[index + i] = data[i];
-      type_flags[index + i] = type_flag;
+void write_to_array(uint16_t data[], size_t data_length, uint8_t index, bool type_flag, uint8_t packet_size){
+  while (index < data_length){
+    if (packet_size == 0){
+      uint8_t offset = (data[index] >> 12) & 0b1111;
+      uint16_t byte_data = (data[index]) & 0xFF;
+      data_buffer[index] |= (byte_data << offset);
+      type_flags[index] = 0;
+      index = index + 1;
+    } else {
+      for (uint8_t i = 0; i < packet_size; i++) {
+        data_buffer[index] = data[i];
+        type_flags[index] = type_flag;
+        index = index + 1;
+      }
     }
   }
 }
 
-void post_process_packet(){
-  packet_finished = read_packet();
+void read_from_array(){
+  printf("a");
+}
 
+void post_process_packet(){
+  // process the entire packet, wehther it be single message or a data packet
+  uint8_t packet_finished = read_packet();
+
+  // if we are just a single message
   if (packet_finished == 1){
-    if (!bus_held && packet_finished[0] == 0x4F4F){
+    if (!bus_held && read_buffer[0] == HOLD_BUS){
       bus_held = true;
-      Serial2.write(BUS_HELD);
-      Serial2.write(BUS_HELD);
-    }
-    if (bus_held && packet_finished[0] == SUCCESS_VALUE << 8 & SUCCESS_VALUE){
+
+      uint16_t to_queue_packet[2] = {1, BUS_HELD};
+      enqueue(&uart_write_queue, to_queue_packet, 2);
+    } if (bus_held && read_buffer[0] == (SUCCESS_VALUE << 8) | SUCCESS_VALUE){
       bus_held = false;
-    }
-  elif (packet_finished == 2){
+    } 
+  } else if (packet_finished == 2){
+    // we are a data packet
       uint16_t calculated_checksum = 0;
-      for (uint8_t i = 1; i < data_length + 1; i++){
+      // sum the data and info word
+      for (uint8_t i = 1; i < data_length + 2; i++){
         calculated_checksum = calculated_checksum + read_buffer[i];
       }
       packet_found = false;
-      if (calculated_checksum + read_buffer[packet_index] != 0xFFFF){
-        Serial2.write(FAILURE_VALUE);
-        Serial2.write(FAILURE_VALUE);
+      // get the last word, it will be the reported inverted checksum, it should add with the checksum to be all 1s
+      if (calculated_checksum + read_buffer[data_length + 2] != 0xFFFF){
+        // tell the raspberry pi we have a bad packet
+        uint16_t to_queue_packet[2] = {1, FAILURE_VALUE};
+        enqueue(&uart_write_queue, to_queue_packet, 2);
       } else {
-        
-        Serial2.write(SUCCESS_VALUE);
-        Serial2.write(SUCCESS_VALUE);
+        Serial.println("passed checksum");
+        // we have a good packet
+        uint16_t to_queue_packet[2] = {1, SUCCESS_VALUE};
+        enqueue(&uart_write_queue, to_queue_packet, 2);
+        // retreive individual items from info word
         bool read_flag = read_buffer[1] & 0b1;
         bool type_flag = (read_buffer[1] >> TYPE_FLAG) & 0b1;
         uint8_t index = (read_buffer[1] >> INDEX_START) & 0b111111;
-
-        uint8_t packet_size = (read_buffer[1] >> WORDS_PER_VAL) & 0b11);
+        uint8_t words_per_val = (read_buffer[1] >> WORDS_PER_VAL) & 0b11;
+        uint8_t packet_length = read_buffer[1] >> SIZE_START;
+        // calculate number of bytes per data point
         uint8_t base = 2;
         uint8_t bytes_per_packet = 1;
-        while (packet_size > 0) {
-            if (packet_size % 2 == 1)
+        while (words_per_val > 0) {
+            if (words_per_val % 2 == 1)
                 bytes_per_packet *= base;
 
             base *= base;
-            packet_size /= 2;
+            words_per_val /= 2;
         }
 
+        // check the set flag for reading the array or writing to it
         if (read_flag){
-          read_from_array(index, type_flag, packet_size / 2);          
+          read_from_array();          
         } else {
           bus_held = false;
-          write_to_array(&read_buffer[2], index, type_flag, packet_size / 2);
+          write_to_array(&read_buffer[2], packet_length, index, type_flag, words_per_val / 2);
         }
       }
       
     }
+}
+
+
+void send_write_queue(){
+  if (!is_empty(&uart_write_queue)){
+    Serial.println("Queue not empty");
+    // first word will be the length of the packet
+    uint16_t packet_length[1];
+    Serial.println(packet_length[0]);
+    dequeue(&uart_write_queue, packet_length, 1);
+    // write the actual info
+    uint16_t packet[packet_length[0]];
+    dequeue(&uart_write_queue, packet, packet_length[0]);
+    for (uint8_t i = 0; i < packet_length[0]; i++){
+      Serial2.write(packet[i] >> 8);
+      Serial2.write(packet[i] & 0xFF);
+    }
   }
 }
 
-void write_packet(int serial_port, uint16_t packets[], size_t list_length, InfoPacket info){
-
-  Serial2.write(HEADER_VALUE);
-  Serial2.write(HEADER_VALUE);
+void write_packet(uint16_t data[], size_t list_length, InfoPacket info){
+  uint16_t to_queue_packet[list_length + 4];
+  to_queue_packet[0] = list_length + 3;
+  to_queue_packet[1] = HEADER_VALUE;
   uint16_t checksum = 0;
   uint16_t info_packet = 0;
   info_packet |= info.read_flag << READ_FLAG;
-  info_packet |= (info.words_per_val << WORD_PER_VAL) & 0b11;
+  info_packet |= (info.words_per_val << WORDS_PER_VAL);
   info_packet |= info.type_flag << TYPE_FLAG;
-  info_packet |= (info.index_location << INDEX_START) & 0b111111;
-  info_packet |= (list_length << SIZE_START) & 0b111111;
+  info_packet |= (info.index_location << INDEX_START);
+  info_packet |= (list_length << SIZE_START);
   checksum = checksum + info_packet;
-  write(serial_port, &info_packet, sizeof(info_packet));
+  to_queue_packet[2] = info_packet;
 
   for (uint8_t i = 0; i < list_length; i = i + 1){
-      Serial2.write(packets[i] >> 8);
-      Serial2.write(packets[i] & 0xFF);
-      checksum = checksum + packets[i];
+      to_queue_packet[i + 3] = data[i];
+      checksum = checksum + data[i];
   }
-  checksum = ~checksum;
   // invert checksum to use summation instead and avoid power off issue
-  Serial2.write(checksum[i] >> 8);
-  Serial2.write(checksum[i] & 0xFF);
+  checksum = ~checksum;
+  to_queue_packet[list_length + 3] = checksum;
+  enqueue(&uart_write_queue, to_queue_packet, list_length + 4);
+}
+
+void write_dangerous_temperature(){
+    InfoPacket info_packet = {
+      .read_flag = false,
+      .words_per_val = 0,
+      .type_flag = false,
+      .index_location = FLAG_INDEX,
+    };
+    uint8_t offset = 1;
+    uint8_t length = 0;
+    uint8_t data = 1;
+    uint16_t packet[1] = {data | (length << 8) | (offset << 11)};
+    write_packet(packet, 1, info_packet);
 }
 
 void loop() {
   uint32_t current_time = millis();
   // uint16_t packet = read_packet();
-  uint16_t packet_to_send[1] = {0x5555};
-  write_packet(packet_to_send, 1);
-  delay(1000);
+  while (true){
+    write_dangerous_temperature();
+    delayMicroseconds(1000);
+    send_write_queue();
+
+  }
   if (0 == START_CALIBRATION){
 
     calibrate_gyroscopes(); 
