@@ -20,7 +20,8 @@
 #define SIZE_START 10
 
 #define HEADER_VALUE 0x5454 // 01010100
-#define FOOTER_VALUE 0x00 // 01010100
+#define HOLD_BUS 0x1414
+
 
 #define FLAG_INDEX 0
 
@@ -165,10 +166,10 @@ void setup_packet_for_sending(int serial_port, uint16_t data[], size_t list_leng
     uint16_t checksum = 0;
     uint16_t info_packet = 0;
     info_packet |= info.read_flag << READ_FLAG;
-    info_packet |= (info.words_per_val << WORD_PER_VAL) & 0b11;
+    info_packet |= info.words_per_val << WORD_PER_VAL;
     info_packet |= info.type_flag << TYPE_FLAG;
-    info_packet |= (info.index_location << INDEX_START) & 0b111111;
-    info_packet |= (list_length << SIZE_START) & 0b111111;
+    info_packet |= info.index_location << INDEX_START;
+    info_packet |= list_length << SIZE_START;
     checksum = checksum + info_packet;
     to_queue_packet[2] = info_packet;
 
