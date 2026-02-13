@@ -10,23 +10,27 @@
 #include <sys/ioctl.h>
 
 
-#define INPUT_SIZE 8 * 1000000
+#define INPUT_SIZE 8 * 1000
 #define RUN_COUNT 100
 
 #define READ_FLAG 0
-#define WORD_PER_VAL 1
+#define WORDS_PER_VAL 1
 #define TYPE_FLAG 3
 #define INDEX_START 4
 #define SIZE_START 10
 
 #define HEADER_VALUE 0x5454 // 01010100
 #define HOLD_BUS 0x1414
-
+#define HEADER_VALUE 0x5454
+#define FAILURE_VALUE 0x6767
+#define SUCCESS_VALUE 0x7272
+#define BUS_HELD 0x3232
 
 #define FLAG_INDEX 0
 
 uint8_t input_information[INPUT_SIZE];
 
+// pass in struct for constructing UART data word
 typedef struct {
     bool read_flag;
     uint8_t words_per_val;
@@ -34,6 +38,7 @@ typedef struct {
     uint8_t index_location;
 } InfoPacket;
 
+// queue for holding write instructions for uart
 typedef struct {
     uint16_t data[1024];
     int8_t front;
@@ -44,20 +49,24 @@ typedef struct {
 Queue uart_write_queue;
 
 void init_queue(Queue *q) {
+    // initialize the queue placement variables
     q->front = 0;
     q->rear = -1;
     q->count = 0;
 }
 
 bool is_empty(Queue *q) {
+    // check if the queue is empty
     return q->count == 0;
 }
 
 bool is_full(Queue *q) {
+    // check if the queue is full
     return q->count == 1024;
 }
 
 bool enqueue(Queue *q, uint16_t values[], size_t number_of_values) {
+    // queue in a list of 16 bit values to the back
     if (is_full(q)) return false;
     for (uint8_t i = 0; i < number_of_values; i++){
         q->rear = (q->rear + 1) % 1024;
@@ -68,6 +77,7 @@ bool enqueue(Queue *q, uint16_t values[], size_t number_of_values) {
 }
 
 bool dequeue(Queue *q, uint16_t values[], size_t number_of_values) {
+    // pop off a list of 16 bit values from the front
     if (is_empty(q)) return false;
     for (uint8_t i = 0; i < number_of_values; i++){
         values[i] = q->data[q->front];
@@ -76,27 +86,28 @@ bool dequeue(Queue *q, uint16_t values[], size_t number_of_values) {
     }
     return true;
 }
-
-bool peek(Queue *q, uint8_t *value) {
-    if (is_empty(q)) return false;
-    *value = q->data[q->front];
-    return true;
-}
-
+struct timespec start, end;
 
 void write_to_hard_drive(){
+    // a test to see the average time to write to the hard drive
     const char* filename = "binary_file.bin";
-    float seconds_sum = 0;
-    for (uint16_t i; i < RUN_COUNT; i = i + 1){
+    double seconds_sum = 0;
+    for (uint16_t i = 0; i < RUN_COUNT; i = i + 1){
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
         FILE *file_pointer = fopen(filename, "wb");
-        clock_t start = clock();
         // write to hard drive
         if (file_pointer != NULL) {
             fwrite(input_information, sizeof(uint8_t), INPUT_SIZE, file_pointer);
+            fflush(file_pointer);
+            fsync(fileno(file_pointer));
         }
-        clock_t end = clock();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        fclose(file_pointer);
         remove(filename);
-        seconds_sum = seconds_sum + (float)(end - start) / CLOCKS_PER_SEC;
+
+        double time_taken = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+        seconds_sum = seconds_sum + time_taken;
     }
     seconds_sum = seconds_sum / RUN_COUNT;
     printf("Average Number of seconds passed to write to hard drive %f.\n", seconds_sum);
@@ -104,6 +115,7 @@ void write_to_hard_drive(){
 }
 
 int setup_serial(){
+    // initialize the uart port and setup the paramaters for it
     // open usb port
     int serial_port = open("/dev/serial0", O_RDWR);
 
@@ -147,8 +159,12 @@ int setup_serial(){
     return serial_port;
 }
 
+
 void send_write_buffer(uint8_t serial_port){
+    // write a packet from the front of the queue
     if (!is_empty(&uart_write_queue)){
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
         // first word will be the length of the packet
         uint16_t packet_length[1];
         dequeue(&uart_write_queue, packet_length, 1);
@@ -156,17 +172,20 @@ void send_write_buffer(uint8_t serial_port){
         uint16_t packet[packet_length[0]];
         dequeue(&uart_write_queue, packet, packet_length[0]);
         write(serial_port, packet, sizeof(packet));
+        
     }
 }
 
 void setup_packet_for_sending(int serial_port, uint16_t data[], size_t list_length, InfoPacket info){
+    // based on passed in info, enqueue a list of 16 bit values so it wil be sent at the next write
     uint16_t to_queue_packet[list_length + 4];
     to_queue_packet[0] = list_length + 3;
     to_queue_packet[1] = HEADER_VALUE;
     uint16_t checksum = 0;
     uint16_t info_packet = 0;
+    // devlutter the information word
     info_packet |= info.read_flag << READ_FLAG;
-    info_packet |= info.words_per_val << WORD_PER_VAL;
+    info_packet |= info.words_per_val << WORDS_PER_VAL;
     info_packet |= info.type_flag << TYPE_FLAG;
     info_packet |= info.index_location << INDEX_START;
     info_packet |= list_length << SIZE_START;
@@ -182,13 +201,26 @@ void setup_packet_for_sending(int serial_port, uint16_t data[], size_t list_leng
     checksum = ~checksum;
     to_queue_packet[list_length + 3] = checksum;
     enqueue(&uart_write_queue, to_queue_packet, list_length + 4);
+
     
 }
 
-uint16_t read_words(uint8_t serial_port, uint16_t *word){
+// global variables for now
+uint8_t packet_index = 0;
+uint8_t data_length = 0;
+uint16_t read_buffer[32];
+uint16_t data_buffer[64];
+bool type_flags[64];
+bool bus_held = false;
+bool packet_found = false;
+
+
+uint16_t read_word(uint8_t serial_port, uint16_t *word){
+    // read a word from the rx buffer if there are two bytes
     uint8_t current_packet[2];
     int8_t response_value = read(serial_port, current_packet, sizeof(current_packet));
     if (response_value < 0){
+        // if there is an error from the response, print it out and return 1
         if (errno == EAGAIN){
             usleep(1000);
         } else{
@@ -196,41 +228,60 @@ uint16_t read_words(uint8_t serial_port, uint16_t *word){
             return 1;
         }
     } else {
-        *word = (second_byte << 8) | first_byte;
-        return 0
+        *word = (current_packet[1] << 8) | current_packet[0];
+        return 0;
     }
 }
 
 uint8_t read_packet(uint8_t serial_port){
-  while (ioctl(fd, FIONREAD, &bytes_available) >= 2){
-      uint16_t current_word;
-      read_words(serial_port, &current_word);
-      
-      read_buffer[packet_index] = current_word;
-      if (current_word == HEADER_VALUE){
-        packet_found = true;
-      } else if (packet_found) {
-        if (packet_index == 1) {
-          data_length = ((read_buffer[packet_index] >> 10) & 0b111111);
-        } if (packet_index - 1 > data_length){
-          packet_index = 0;
-          return 2;
+    // read the entire packet if it is available in full
+    uint8_t bytes_available;
+    ioctl(serial_port, FIONREAD, &bytes_available);
+    while (bytes_available >= 2){
+        uint16_t current_word;
+        read_word(serial_port, &current_word);
+
+        read_buffer[packet_index] = current_word;
+        if (current_word == HEADER_VALUE){
+            // if we have a header inform further reads that it is a data packet
+            packet_found = true;
+        } else if (packet_found) {
+            if (packet_index == 1) {
+                // extract length from info word
+                data_length = ((read_buffer[packet_index] >> 10) & 0b111111);
+            } if (packet_index - 1 > data_length){
+                // we ended, this should return an enum
+                packet_index = 0;
+                return 2;
+            }
+        } else {
+            // we found a value, but it isn't for a data packet
+            packet_index = 0;
+            return 1;
         }
-      } else {
-        packet_index = 0;
-        return 1;
-      }
-      packet_index += 1;
+        packet_index += 1;
     }
-  return 0;
+    // no packet
+    return 0;
 }
 
-void post_process_packet(){
+void post_process_packet(uint8_t serial_port){
   // process the entire packet, wehther it be single message or a data packet
-  uint8_t packet_finished = read_packet();
+  uint8_t packet_finished = read_packet(serial_port);
 
   // if we are just a single message
   if (packet_finished == 1){
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    printf("Found %i\n", read_buffer[0]);
+    uint32_t seconds = end.tv_sec - start.tv_sec;
+    uint32_t nseconds = end.tv_nsec - start.tv_nsec;
+
+    if (nseconds < 0) {
+        seconds --;
+        nseconds += 1000000000;
+    }
+    printf("Time taken: %i\n", seconds * 1000000 + nseconds / 1000);
+    fflush(stdout);
     if (!bus_held && read_buffer[0] == HOLD_BUS){
       bus_held = true;
 
@@ -275,10 +326,11 @@ void post_process_packet(){
 
         // check the set flag for reading the array or writing to it
         if (read_flag){
-          noop;        
+            ;
         } else {
           bus_held = false;
-          write_to_array(&read_buffer[2], packet_length, index, type_flag, words_per_val / 2);
+          ;  
+        //   write_to_array(&read_buffer[2], packet_length, index, type_flag, words_per_val / 2);
         }
       }
       
@@ -286,6 +338,8 @@ void post_process_packet(){
 }
 
 void start_calibration(uint8_t serial_port){
+
+    // inform the arduino that it should start calibration as warmup is done
     InfoPacket info_packet = {
         .read_flag = false,
         .words_per_val = 0,
@@ -300,11 +354,11 @@ void start_calibration(uint8_t serial_port){
 }
 
 void main(){
-    init_queue(&uart_write_queue);
     // write_to_hard_drive();
+
+    init_queue(&uart_write_queue);
     uint8_t serial_port = setup_serial();
     
-
     uint8_t single_value;
 
     uint8_t dump[256];
@@ -314,19 +368,7 @@ void main(){
         start_calibration(serial_port);
         sleep(1);
         send_write_buffer(serial_port);
-        // printf("Bytes Available %i", bytesavail);
+        post_process_packet(serial_port);
 
-
-
-        // if (bytesavail > 2){
-        //     read(serial_port, current_packet, 1);
-        //     if (current_packet[0] == 0x4A && current_packet[1] == 0x4A){
-        //         packet_found = true;
-        //     } else if (current_packet[0] == 0x22 && current_packet[1] == 0x22){
-        //         packet_found = false;
-        //     } else if (packet_found == true){
-        //         printf("Packet Received %i.\n", current_packet[0] << 8 || current_packet[1]);
-        //     }
-        // }
     }
 }
