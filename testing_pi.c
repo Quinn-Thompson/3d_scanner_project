@@ -27,6 +27,8 @@
 #define BUS_HELD 0x3232
 
 #define FLAG_INDEX 0
+#define BELT_INDEX 1
+#define CAMERA_SERVO_INDEX 2
 
 uint8_t input_information[INPUT_SIZE];
 
@@ -171,8 +173,16 @@ void send_write_buffer(uint8_t serial_port){
         // write the actual info
         uint16_t packet[packet_length[0]];
         dequeue(&uart_write_queue, packet, packet_length[0]);
-        write(serial_port, packet, sizeof(packet));
-        
+        printf("I am writing a list of length %i\n", packet_length[0]);
+        uint8_t *ptr = (uint8_t *)packet;
+
+        for (uint8_t i = 0; i < packet_length[0]; i = i + 1){
+            printf("I am sending the packet value %i in index %i\n", packet[i], i);
+        }
+        printf("the packet size is %i\n", packet_length[0] * sizeof(packet[0]));
+                
+        write(serial_port, ptr, packet_length[0] * sizeof(packet[0]));
+        tcdrain(serial_port);
     }
 }
 
@@ -353,6 +363,32 @@ void start_calibration(uint8_t serial_port){
     setup_packet_for_sending(serial_port, packet, 1, info_packet);
 }
 
+void move_belt(uint8_t serial_port){
+
+    // inform the arduino that it should start calibration as warmup is done
+    InfoPacket info_packet = {
+        .read_flag = false,
+        .words_per_val = 1,
+        .type_flag = false,
+        .index_location = BELT_INDEX,
+    };
+    uint16_t packet[1] = {0b111111111110}; 
+    setup_packet_for_sending(serial_port, packet, 1, info_packet);
+}
+
+void rotate_camera(uint8_t serial_port, uint16_t tick_rotation){
+
+    // inform the arduino that it should start calibration as warmup is done
+    InfoPacket info_packet = {
+        .read_flag = false,
+        .words_per_val = 1,
+        .type_flag = false,
+        .index_location = CAMERA_SERVO_INDEX,
+    };
+    uint16_t packet[1] = {tick_rotation}; 
+    setup_packet_for_sending(serial_port, packet, 1, info_packet);
+}
+
 void main(){
     // write_to_hard_drive();
 
@@ -364,11 +400,13 @@ void main(){
     uint8_t dump[256];
     bool packet_found = false;
     tcflush(serial_port, TCIOFLUSH);
-    while (true){
-        start_calibration(serial_port);
-        sleep(1);
-        send_write_buffer(serial_port);
-        post_process_packet(serial_port);
+    rotate_camera(serial_port, 100);
+    // move_belt(serial_port);
+    // start_calibration(serial_port);
 
-    }
+
+    sleep(3);
+    send_write_buffer(serial_port);
+    // send_write_buffer(serial_port);
+    post_process_packet(serial_port);
 }
