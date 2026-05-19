@@ -1,6 +1,17 @@
+// this file needs to be seperated into sections
+/*
+Includes
+*/
+
 #include <Wire.h>
 #include <EEPROM.h>
+#include <util/atomic.h>
 
+/*
+Defines
+*/
+
+// Loading in different biasses if it can't be found in memory but is in eeprom
 #define EEPROM_BIAS_WRITTEN_0_ADDR 0
 #define EEPROM_BIAS_WRITTEN_1_ADDR 1
 
@@ -17,6 +28,7 @@
 #define EEPROM_BIAS_CHECK_0_VAL 0x4A
 #define EEPROM_BIAS_CHECK_1_VAL 0xB1
 
+// IMU register addresses for MDU
 #define GYRO_CONFIG 0x1B
 #define ACCEL_CONFIG 0x1C
 #define SMPLRT_DIV 0x19
@@ -28,15 +40,18 @@
 #define FIFO_COUNTH 0x72
 #define FIFO_R_W 0x74
 
+// the IMU I2C address
 #define PLATE_IMU_ADDR 0x68
 #define CAMERA_IMU_ADDR 0x69
 
+// Some indexes/bus values
 #define PLATE_SERVO 1
 #define CAMERA_SERVO 2
 
 #define PLATE_ID 0
 #define CAMERA_ID 1
 
+// UART buffer indices for the servo packets
 #define HEADER_1_INDEX 0
 #define HEADER_2_INDEX 1
 #define SERVO_ID_INDEX 2
@@ -45,12 +60,14 @@
 #define PARAM_START_INDEX 5
 #define SMALLEST_BUS_SIZE 6
 
+// different command registers
 #define SERVO_MOVE_TIME_WRITE 1
 #define SERVO_ID_WRITE 13
 #define SERVO_POS_READ 28
 #define SERVO_OR_MOTOR_MODE_WRITE 29
 #define SERVO_OR_MOTOR_MODE_READ 30
 
+// connected pins
 #define PLATE_IMU_ADDR_PIN 2
 #define CAMERA_IMU_ADDR_PIN 3
 #define EN_SERIAL_PIN 4
@@ -60,10 +77,12 @@
 
 #define FRAME_HEADER 0x55
 
+// some macros for byte convesion
 #define GET_LOW_BYTE(A) (uint8_t)((A))
 #define GET_HIGH_BYTE(A) (uint8_t)((A) >> 8)
 #define BYTE_TO_WORD(A, B) ((((uint16_t)(A)) << 8) | (uint8_t)(B))
 
+// some default values for calibration
 #define NO_VAL 0xFF
 #define FSR (500.0 / 32768.0)
 #define IMU_DIVIDER 2
@@ -74,23 +93,28 @@
 #define SERVO_WAIT 100000
 #define GYRO_SERVO_WAIT 30
 
-#define START_CALIBRATION 0x0001
+// specific headers for singular commands
+#define START_CALIBRATION 0x0000
 #define HEADER_VALUE 0x5454 // 00101010
 #define FAILURE_VALUE 0x6767 // 00101010
 #define SUCCESS_VALUE 0x7272 // 00101010
 #define BUS_HELD 0x3232 // 00101010
 #define HOLD_BUS 0x1414 // 00101010
 
-
+// UART arduino buffer indices
 #define READ_FLAG 0
 #define WORDS_PER_VAL 1
 #define TYPE_FLAG 3
 #define INDEX_START 4
 #define SIZE_START 10
 
+#define STEPPER_PULSE_PIN 11
+#define STEPPER_DIR_PIN 8
+
 #define TICK_TO_ANGLE(tick) (tick * 240.0f) / 1000.0f
 #define ANGLE_TO_TICK(angle) (angle * 1000) / 240
 
+// Assertion macros
 #define ASSERT_TRUE(cond, msg)                          \
     do {                                                \
         if ((cond)) {                                   \
@@ -129,6 +153,10 @@
         Serial.println(msg2);                        \
       }                                              \
     } while (0)
+
+/*
+Globals
+*/
 
 uint16_t current_roll = 0;
 uint32_t last_read = 0;
@@ -192,6 +220,11 @@ struct CalibrationItems{
   int16_t reset_position = NO_VAL;
 };
 
+/*
+Queue
+*/
+
+// Define queues for sending out information to the pi on UART
 typedef struct {
     uint16_t data[64];
     int8_t front;
@@ -239,16 +272,26 @@ bool peek(Queue *q, uint8_t *value) {
     return true;
 }
 
+/*
+Servo UART
+*/
+
 void write_serial_buffer(uint8_t servo_id, uint8_t command, uint16_t *parameters, size_t param_length, bool only_write){
+  // Write to the servos using the serial buffer
+  //
+
+  // check we are using an actual ID, if so turn off the path to the others servo
   if (servo_id != 0xFE){
      digitalWrite(servo_en_addr[servo_id-1], LOW);
   }
+  // manually clear the uart ransmit flag
   UCSR1A |= (1 << TXC1);
   
   digitalWrite(EN_SERIAL_PIN, HIGH);
   uint8_t checksum = 0;
   uint8_t buffer[6 + param_length];
   
+  // setup the buffer with all the information that needs to be send
 	buffer[HEADER_1_INDEX] = FRAME_HEADER;
 	buffer[HEADER_2_INDEX] = FRAME_HEADER;
   buffer[SERVO_ID_INDEX] = servo_id;
@@ -263,16 +306,20 @@ void write_serial_buffer(uint8_t servo_id, uint8_t command, uint16_t *parameters
     checksum = checksum + buffer[PARAM_START_INDEX + i*2] + buffer[PARAM_START_INDEX + 1 + i*2];
   }
   buffer[PARAM_START_INDEX + param_length] = (uint8_t)(~checksum);
-  
+    // send the buffer and make sure to flush it otherwise issues can happen
   Serial1.write(buffer, param_length + 6);
   Serial1.flush();
+  // enable reading
   digitalWrite(EN_SERIAL_PIN, LOW);
+  // turn on the tx servo paths
   if (only_write && servo_id != 0xFE){
     digitalWrite(servo_en_addr[servo_id-1], HIGH);
   }
 }
 
 ReadStatus read_serial_buffer(uint8_t* read_buffer, size_t buffer_size){
+  // Read the arduinos rx hardware buffer
+  //
   uint8_t checksum = 0;
   uint8_t single_byte;
   uint8_t header_1 = Serial1.read();
@@ -284,6 +331,7 @@ ReadStatus read_serial_buffer(uint8_t* read_buffer, size_t buffer_size){
   uint8_t command = Serial1.read();
   checksum = checksum + command;
   bool warn_condition = length + 3 > buffer_size;
+  // print out warnings if there isn't enough from the buffer 
   WARN_TRUE_MULTI(warn_condition, "ON SERVO", servo_id, "NO DATA TO READ.");
   WARN_TRUE_MULTI(warn_condition, "LENGTH", length + 3 > buffer_size, buffer_size);
   if (warn_condition) return READ_NO_DATA;
@@ -304,6 +352,7 @@ ReadStatus read_serial_buffer(uint8_t* read_buffer, size_t buffer_size){
   read_buffer[buffer_size - 1] = read_checksum;
 
   warn_condition = (uint8_t)(~checksum) != read_buffer[buffer_size - 1];
+  // if the checksums don't match, inform the user
   WARN_TRUE_MULTI(warn_condition, "ON SERVO", servo_id, "CHECKSUM FAILED.");
   if (warn_condition) return READ_CHECKSUM_ERROR;
 
@@ -311,8 +360,10 @@ ReadStatus read_serial_buffer(uint8_t* read_buffer, size_t buffer_size){
 }
 
 ReadStatus write_and_read_buffer(uint8_t *read_buffer, size_t buffer_size, uint8_t servo_id, uint8_t command, uint16_t *parameters, size_t param_length){
+  // writes and then reads from UART
   write_serial_buffer(servo_id, command, parameters, param_length, false);
   unsigned long start = millis();
+  // provide a 43 microsecond delay between availability checks as this enters the nyquist for 115200 baud
   delayMicroseconds(43);
   
   while (Serial1.available() < buffer_size) {
@@ -326,6 +377,7 @@ ReadStatus write_and_read_buffer(uint8_t *read_buffer, size_t buffer_size, uint8
   ReadStatus status = read_serial_buffer(read_buffer, buffer_size);
   digitalWrite(servo_en_addr[servo_id-1], HIGH);
   Serial1.flush();
+  // Check for specific errors from the read buffer like not matching bus between send and return
   if (status == READ_OK){
     if (command != read_buffer[COMMAND_INDEX]){
       WARN("COMMAND MISMATCH BETWEEN SEND AND RETURN.");
@@ -343,6 +395,7 @@ ReadStatus write_and_read_buffer(uint8_t *read_buffer, size_t buffer_size, uint8
 
 void servo_id_write(uint8_t servo_id, uint16_t id)
 {
+  // write the ID, we have to do this because the ID resets on startup
   uint16_t parameters[1];
   parameters[0] = id;
   size_t length = sizeof(parameters) / sizeof(uint8_t);
@@ -351,6 +404,7 @@ void servo_id_write(uint8_t servo_id, uint16_t id)
 
 void servo_move_time_write(uint8_t servo_id, uint16_t tick_position, uint16_t speed)
 {
+  // Moves the servo to a position, where speed is slower at higher numbers
   uint16_t parameters[2];
   parameters[0] = tick_position;
   parameters[1] = speed;
@@ -359,6 +413,7 @@ void servo_move_time_write(uint8_t servo_id, uint16_t tick_position, uint16_t sp
 }
 
 uint16_t servo_get_pos(uint8_t servo_id, uint8_t attempt_count){
+  // Acquire the current position from the encoder.
   uint8_t return_bytes = 2;
   uint8_t read_buffer[SMALLEST_BUS_SIZE + return_bytes];
   ReadStatus status;
@@ -374,6 +429,7 @@ uint16_t servo_get_pos(uint8_t servo_id, uint8_t attempt_count){
 
 void servo_set_motor_mode(uint8_t servo_id, uint16_t speed)
 {
+  // Set the mode of the servo to use a free motor
   uint16_t parameters[2];
   parameters[0] = 0;
   parameters[1] = speed;
@@ -383,6 +439,7 @@ void servo_set_motor_mode(uint8_t servo_id, uint16_t speed)
 
 void servo_set_servo_mode(uint8_t servo_id)
 {
+  // Set the mode of the servo to use the PID feedback.
   uint16_t parameters[1];
   parameters[0] = 1;
   size_t length = sizeof(parameters) / sizeof(uint8_t);
@@ -390,6 +447,7 @@ void servo_set_servo_mode(uint8_t servo_id)
 }
 
 bool servo_is_servo_mode(uint8_t servo_id, uint8_t attempt_count){
+  // Check if the current mode of the servo is free motor or PID feedback
   uint8_t return_bytes = 4;
   uint8_t read_buffer[SMALLEST_BUS_SIZE + return_bytes];
   ReadStatus status;
@@ -403,17 +461,82 @@ bool servo_is_servo_mode(uint8_t servo_id, uint8_t attempt_count){
   }
 }
 
+/*
+Stepper Motor Functionality
+*/
+
 Queue uart_write_queue;
 
+volatile int32_t steps_to_take = 0;
+
+// 5 clock cycle delay, program counter pushed to stack and a vector jump occurs
+ISR(TIMER1_COMPA_vect) {
+  if (--steps_to_take == 0) // DEC, BRNE = ~5 clock cycles
+  {
+    TCCR1B &= ~(1 << CS11);  // LSL, ANDI, STS  = ~ 3 cycles
+    
+    TIMSK1 &= ~(1 << OCIE1A); = // LSL, ANDI, STS = ~ 3 cycles
+    TCCR1A &= ~((1 << COM1A1) | (1 << COM1A0)); // = LSL, ANDI,  STS = ~ 3 cycles
+    
+    PORTB &= ~(1 << PB5); // LSL, ANDI, STS = ~ 3 cycles
+    
+    TCCR1A |= (1 << COM1A0); // CBI  = 1 cycle
+  }
+}
+// 8 clock cycle delay to reload CPU state
+
+#define MILLIMETER_TO_STEPS 49
+
+void step_motor_millimeters(uint16_t millimeters){
+  int16_t current_steps;
+  // whenever accessing current steps, atomics need to be used to prevent race conditions
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    current_steps = steps_to_take;
+  }
+  if (current_steps == 0){
+    Serial.println("test");
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+      steps_to_take = millimeters * MILLIMETER_TO_STEPS * 2;
+    }
+    // being pwm output 
+    TCNT1 = 0;
+    TIMSK1 |= (1 << OCIE1A);
+    // start clock (Prescaler 8)
+    TCCR1B |= (1 << CS11);  
+    DDRB |= (1 << PB5);
+
+
+  }
+}
+
+/*
+Initialization
+*/
+
 void setup() {
+
+  // code serial
   Serial.begin(115200);
   while (!Serial) { ; }
+  // servo serial
   Serial1.begin(115200);
   while (!Serial1) { ; }
+  // raspi serial
   Serial2.begin(115200);
   while (!Serial2) { ; }
   delay(500);
-  
+  // interrupt when match on timer 1
+  TCCR1A = (1 << COM1A0);
+  TCCR1B = (1 << WGM12);
+  OCR1A = 299;
+  // initialize counter
+  TCNT1  = 0; 
+
+  pinMode(STEPPER_PULSE_PIN, OUTPUT);
+  pinMode(STEPPER_DIR_PIN, OUTPUT);
+  digitalWrite(STEPPER_DIR_PIN, HIGH);
+  sei();
+
   init_queue(&uart_write_queue);
 
   bool no_connection = true;
@@ -519,24 +642,12 @@ void setup() {
   
 }
 
-void step_camera_servo(float upward){
-  if (upward && 65535 - vertical_step_angle > vertical_angle) {
-    vertical_angle = vertical_angle + vertical_step_angle;
-  } else if (vertical_angle > vertical_step_angle) {
-    vertical_angle = vertical_angle + vertical_step_angle;
-  }
-  return vertical_angle;
-}
-
-void begin_plate_servo_rotation(uint32_t const current_time){
-  begin_state_rotation = true;
-  started_plate_rotation = current_time;
-  stopped_plate_rotation = 0;
-  current_gyro_rotation = 0.0;
-  plate_start_location = servo_get_pos(PLATE_SERVO, 5); 
-}
+/*
+Runtime Code
+*/
 
 void rotate_plate_servo(uint32_t const current_time, float new_position){
+  // rotate the servo and check to see if the encoder angle is close to the input angle 
   int16_t const current_position = servo_get_pos(PLATE_SERVO, 5);
   int16_t const position_difference = current_position - plate_start_location;
   current_gyro_rotation = current_gyro_rotation + read_rotation_of_imu(PLATE_ID);
@@ -561,6 +672,7 @@ void rotate_plate_servo(uint32_t const current_time, float new_position){
 }
 
 void rotate_camera_servo(uint32_t const current_time, float new_position){
+  // Rotate the servo to a specific position
   int16_t const current_position = servo_get_pos(CAMERA_SERVO, 5);
   int16_t const position_difference = current_position - plate_start_location;
   current_gyro_rotation = current_gyro_rotation + read_rotation_of_imu(PLATE_ID);
@@ -585,7 +697,12 @@ void rotate_camera_servo(uint32_t const current_time, float new_position){
   }
 }
 
+/*
+Calibration Code
+*/
+
 float read_rotation_of_imu(uint8_t part_id){
+  // we have to use the fifo because it's static increments of time versus read by time which can create jitters in time for determining actual position
   uint16_t count = read_fifo_count(serial_addr[part_id]);
   int32_t total_gyro_z_velocity = 0;
   while (count >= 2) {
@@ -594,6 +711,7 @@ float read_rotation_of_imu(uint8_t part_id){
     count -= 2;
   }
 
+  // FSR is a divider on chip used to create more accurate measurements but more noisy measurements/ prone to rollover
   if (total_gyro_z_velocity > 0) {
     total_gyro_z_velocity = ((float)(total_gyro_z_velocity) * FSR * IMU_DIVIDED * forward_bias[part_id]);
   } else if (total_gyro_z_velocity < 0) {
@@ -603,7 +721,9 @@ float read_rotation_of_imu(uint8_t part_id){
   return total_gyro_z_velocity;
 }
 
+
 int16_t read_int_16_bits(){
+  // read word on i2c line
   uint8_t read_attempts = 0;
   while (Wire.available() < 2) {
     if (read_attempts > 20){
@@ -614,7 +734,9 @@ int16_t read_int_16_bits(){
   return Wire.read() << 8 | Wire.read();
 }
 
+
 int16_t read_fifo(uint8_t serial_address){
+  // read the first in first out buffer and return a word 
   Wire.beginTransmission(serial_address);
   Wire.write(FIFO_R_W);
   Wire.endTransmission(false);
@@ -628,6 +750,7 @@ void acquire_current_rotation(
   uint8_t part_id,
   CalibrationItems *calib_items
 ){
+  // use the measurment from fifo and the static bias to calculate teh current rotation
   uint16_t count = read_fifo_count(serial_address);
   
   while (count >= 2) {
@@ -640,6 +763,7 @@ void acquire_current_rotation(
 }
 
 uint16_t read_fifo_count(uint8_t serial_address){
+  // check the fifo to see if it has overflowed
   Wire.beginTransmission(serial_address);
   Wire.write(FIFO_COUNTH);
   Wire.endTransmission(false);
@@ -648,6 +772,7 @@ uint16_t read_fifo_count(uint8_t serial_address){
   uint16_t count = (Wire.read() << 8) | Wire.read();
 
   if (count >= 1024) {
+    WARN("FIFO overflow, resetting.")
     reset_fifo(serial_address);
     Wire.beginTransmission(serial_address);
     Wire.write(FIFO_COUNTH);
@@ -660,6 +785,7 @@ uint16_t read_fifo_count(uint8_t serial_address){
 }
 
 void reset_fifo(uint8_t serial_address){
+  // reset the fifo by turning it off, setting the reset index and the turning it back on and waiting for a signal that it is back on
   Serial.println("Resetting Fifo");
   Wire.beginTransmission(serial_address);
   Wire.write(USER_CTRL);
@@ -687,6 +813,7 @@ void reset_fifo(uint8_t serial_address){
 }
 
 void check_at_origin(uint8_t servo_address, CalibrationItems *calib_items, uint32_t const current_time){
+  // Move to the origin and wait until we hit the origin 
   int16_t const current_position = servo_get_pos(servo_address, 5);
 
   if (calib_items->finished_reset_time == NO_VAL && -4 < current_position && current_position < 4) {
@@ -714,6 +841,7 @@ void check_at_origin(uint8_t servo_address, CalibrationItems *calib_items, uint3
 }
 
 int16_t acquire_static_bias(uint8_t serial_address, CalibrationItems *calib_items){
+  // check the fifo while we at the origin, then when we hit a certain number of runs find the average displacement
   uint16_t count = read_fifo_count(serial_address);
 
   // read all values from fifo
@@ -746,12 +874,15 @@ int16_t acquire_forward_bias(
   uint32_t const current_time,
   CalibrationItems *calib_items
 ){
+  // acquire the current position
   int16_t const current_position = servo_get_pos(servo_addr[part_id], 5);
 
+  // check if we have finished already, and if we havent and we are at position, we are done
   if (calib_items->finished_dynamic_time == NO_VAL && JUMP_POS - 4 < current_position && current_position < JUMP_POS + 4) {
     calib_items->finished_dynamic_time = current_time;
   }
 
+  // wait for a bit before actually doing calculations
   if (calib_items->finished_dynamic_time != NO_VAL && current_time - calib_items->finished_dynamic_time > GYRO_SERVO_WAIT){
     float const delta_position = (float)current_position - (float)calib_items->reset_position;
     calib_items->fbcalib_total = calib_items->fbcalib_total + (calib_items->current_rotation * 1000.0f) / (delta_position * 240.0f);
@@ -763,7 +894,7 @@ int16_t acquire_forward_bias(
 
     Serial.print("Forward Bias Total: ");
     Serial.println(calib_items->fbcalib_total);
-
+    // we have finished one more run
     calib_items->calib_runs = calib_items->calib_runs + 1;
     Serial.print("Forward Bias runs: ");
     Serial.println(calib_items->calib_runs);
@@ -775,6 +906,7 @@ int16_t acquire_forward_bias(
     reset_fifo(serial_addr[part_id]);
     servo_move_time_write(servo_addr[part_id], 0, 300);
     Serial.println("Moving back to zero");
+    // if we have run enough times
     if (calib_items->calib_runs > DYNAMIC_CALIB_RUNS){
       calib_items->started_dynamic = false;
       forward_bias[part_id] = calib_items->fbcalib_total / calib_items->calib_runs;
@@ -789,13 +921,16 @@ int16_t acquire_forward_bias(
 }
 
 bool run_gyro_calibrations(uint8_t part_id, CalibrationItems *calib_items, uint32_t current_time){
-
+  // The actual hecker for what session we are in
+  // we are moving back to origin
   if (calib_items->started_reset){
     acquire_current_rotation(servo_addr[part_id], serial_addr[part_id], part_id, calib_items);
     check_at_origin(servo_addr[part_id], calib_items, current_time);
   } else if (calib_items->started_static) {
+    //static bias
     static_bias[part_id] = acquire_static_bias(serial_addr[part_id], calib_items);
   } else if (calib_items->started_dynamic){
+    // dynamic bias
     if (!calib_items->moving){
       Serial.println("Moving to angle");
       reset_fifo(serial_addr[part_id]);
@@ -812,7 +947,7 @@ bool run_gyro_calibrations(uint8_t part_id, CalibrationItems *calib_items, uint3
 }
 
 bool run_servo_calibrations(uint8_t part_id, uint32_t current_time, uint32_t *matched_time, int16_t *rotation, int16_t *servo_bias_total, uint8_t *servo_bias_runs){
-  
+  // moves the servo back to the origin and measures the static difference
   int16_t const current_position = servo_get_pos(servo_addr[part_id], 50);
   if (*rotation > 1000){
     servo_bias[part_id] = *servo_bias_total / *servo_bias_runs;
@@ -836,6 +971,7 @@ bool run_servo_calibrations(uint8_t part_id, uint32_t current_time, uint32_t *ma
 }
 
 void calibrate_gyroscopes(){
+  // The calibration loop, appointed its own memory space
   CalibrationItems plate_calib_items;
   CalibrationItems camera_calib_items;
 
@@ -865,18 +1001,18 @@ void calibrate_gyroscopes(){
   uint32_t plate_matched_time = NO_VAL;
   uint32_t camera_matched_time = NO_VAL;
 
-  while (!acq_cam_cal || !acq_plate_cal){
+  while (!acq_plate_cal){
     current_time = millis();
     if (!acq_plate_servo){
       acq_plate_servo = run_servo_calibrations(PLATE_ID, current_time, &plate_matched_time, &plate_bias_rotation, &plate_bias_total, &plate_bias_runs);
     } else {
       acq_plate_cal = run_gyro_calibrations(PLATE_ID, &plate_calib_items, current_time);
     }
-    if (!acq_camera_servo){
-      acq_camera_servo = run_servo_calibrations(CAMERA_ID, current_time, &camera_matched_time, &camera_bias_rotation, &camera_bias_total, &camera_bias_runs);
-    } else {
-      acq_cam_cal = run_gyro_calibrations(CAMERA_ID, &camera_calib_items, current_time);
-    }
+    // if (!acq_camera_servo){
+    //   acq_camera_servo = run_servo_calibrations(CAMERA_ID, current_time, &camera_matched_time, &camera_bias_rotation, &camera_bias_total, &camera_bias_runs);
+    // } else {
+    //   acq_cam_cal = run_gyro_calibrations(CAMERA_ID, &camera_calib_items, current_time);
+    // }
   }
 
   EEPROM.update(EEPROM_BIAS_WRITTEN_0_ADDR, EEPROM_BIAS_CHECK_0_VAL);
@@ -892,18 +1028,22 @@ void calibrate_gyroscopes(){
   
 }
 
+/*
+UART communication with pi
+*/
+
 uint32_t test_rotate_time = 0;
 uint32_t pin_low = 0;
 uint8_t packet_index = 0;
 uint8_t data_length = 0;
-uint16_t read_buffer[32];
-uint16_t data_buffer[64];
-bool type_flags[64];
+uint16_t read_buffer[32] = {0};
+uint16_t data_buffer[64] = {0};
+bool type_flags[64] = {0};
 bool bus_held = false;
 
 
-
 uint8_t read_packet(){
+  // read the incoming packet  and get some basic information
   while (Serial2.available() >= 2){
       uint8_t first_byte = Serial2.read();
       uint8_t second_byte = Serial2.read();
@@ -930,7 +1070,13 @@ uint8_t read_packet(){
 }
 
 void write_to_array(uint16_t data[], size_t data_length, uint8_t index, bool type_flag, uint8_t packet_size){
-  while (index < data_length){
+  // write to another devices buffer array
+  Serial.print("packet_size: ");
+  Serial.println(packet_size);
+  Serial.print("data_length: ");
+  Serial.println(data_length);
+  uint8_t initial_index = index;
+  while (index < data_length + initial_index){
     if (packet_size == 0){
       uint8_t offset = (data[index] >> 12) & 0b1111;
       uint16_t byte_data = (data[index]) & 0xFF;
@@ -938,7 +1084,11 @@ void write_to_array(uint16_t data[], size_t data_length, uint8_t index, bool typ
       type_flags[index] = 0;
       index = index + 1;
     } else {
+      Serial.print("index: ");
+      Serial.println(index);
       for (uint8_t i = 0; i < packet_size; i++) {
+        Serial.print("data[i]: ");
+        Serial.println(data[i]);
         data_buffer[index] = data[i];
         type_flags[index] = type_flag;
         index = index + 1;
@@ -951,12 +1101,19 @@ void read_from_array(){
   printf("a");
 }
 
+unsigned long start;
+unsigned long end;
+
+
 void post_process_packet(){
   // process the entire packet, wehther it be single message or a data packet
   uint8_t packet_finished = read_packet();
 
   // if we are just a single message
   if (packet_finished == 1){
+    end = micros();
+    Serial.print("time_taken: ");
+    Serial.println(end - start);
     if (!bus_held && read_buffer[0] == HOLD_BUS){
       bus_held = true;
 
@@ -966,6 +1123,7 @@ void post_process_packet(){
       bus_held = false;
     } 
   } else if (packet_finished == 2){
+    Serial.println("received pakcet");
     // we are a data packet
       uint16_t calculated_checksum = 0;
       // sum the data and info word
@@ -992,6 +1150,8 @@ void post_process_packet(){
         // calculate number of bytes per data point
         uint8_t base = 2;
         uint8_t bytes_per_packet = 1;
+        Serial.print("packet_length: ");
+        Serial.println(packet_length);
         while (words_per_val > 0) {
             if (words_per_val % 2 == 1)
                 bytes_per_packet *= base;
@@ -999,13 +1159,14 @@ void post_process_packet(){
             base *= base;
             words_per_val /= 2;
         }
-
+        Serial.print("bytes_per_packet: ");
+        Serial.println(bytes_per_packet);
         // check the set flag for reading the array or writing to it
         if (read_flag){
           read_from_array();          
         } else {
           bus_held = false;
-          write_to_array(&read_buffer[2], packet_length, index, type_flag, words_per_val / 2);
+          write_to_array(&read_buffer[2], packet_length, index, type_flag, bytes_per_packet / 2);
         }
       }
       
@@ -1055,6 +1216,7 @@ void write_packet(uint16_t data[], size_t list_length, InfoPacket info){
 }
 
 void write_dangerous_temperature(){
+    // test write temp to inform pi of dangerous temperature
     InfoPacket info_packet = {
       .read_flag = false,
       .words_per_val = 0,
@@ -1068,18 +1230,50 @@ void write_dangerous_temperature(){
     write_packet(packet, 1, info_packet);
 }
 
+void write_moved_servo(){
+    // test write temp to inform pi of dangerous temperature
+    InfoPacket info_packet = {
+      .read_flag = false,
+      .words_per_val = 0,
+      .type_flag = false,
+      .index_location = 7,
+    };
+    uint8_t offset = 1;
+    uint8_t length = 0;
+    uint8_t data = 1;
+    uint16_t packet[1] = {data | (length << 8) | (offset << 11)};
+    write_packet(packet, 1, info_packet);
+}
+
+/*
+Loop
+*/
+
 void loop() {
   uint32_t current_time = millis();
-  // uint16_t packet = read_packet();
-  while (true){
-    write_dangerous_temperature();
-    delayMicroseconds(1000);
-    send_write_queue();
-
-  }
-  if (0 == START_CALIBRATION){
-
+  
+  post_process_packet();
+  send_write_queue();
+  if (data_buffer[0] & (0b1 << START_CALIBRATION) == 1){
+    data_buffer[0] &= ~(1 << START_CALIBRATION);
     calibrate_gyroscopes(); 
     calibration_mode = false;
+  }
+
+  if (data_buffer[1] > 0){
+    Serial.print("running for ");
+    Serial.print(data_buffer[1]);
+    Serial.print(" mm");
+    Serial.println();
+    step_motor_millimeters(data_buffer[1]);
+    data_buffer[1] = 0;
+  }
+
+  if (data_buffer[2] > 0){
+    Serial.print("Rotating servo to ");
+    Serial.print(data_buffer[2]);
+    servo_move_time_write(CAMERA_SERVO, data_buffer[2], 1000);
+    data_buffer[2] = 0;
+    write_moved_servo();
   }
 }
